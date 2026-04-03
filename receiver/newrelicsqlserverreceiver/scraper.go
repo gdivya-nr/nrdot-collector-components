@@ -18,6 +18,7 @@ import (
 	"go.uber.org/multierr"
 	"go.uber.org/zap"
 
+	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/newrelicsqlserverreceiver/apm"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/newrelicsqlserverreceiver/helpers"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/newrelicsqlserverreceiver/internal/metadata"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/newrelicsqlserverreceiver/models"
@@ -47,6 +48,16 @@ var (
 	LastSlowQueryDurationMs int64
 	LastActiveQueryDurationMs int64
 )
+
+// initNewRelicAPM initializes the New Relic APM agent (safe to call multiple times)
+func initNewRelicAPM() error {
+	app, err := apm.Initialize()
+	if app != nil {
+		// Set the global app instance for this receiver package
+		SetGlobalNewRelicApp(app)
+	}
+	return err
+}
 
 // sqlServerScraper handles SQL Server metrics collection
 type sqlServerScraper struct {
@@ -85,6 +96,12 @@ func newSqlServerScraper(settings receiver.Settings, cfg *Config) *sqlServerScra
 // Start initializes the scraper and establishes database connection
 func (s *sqlServerScraper) Start(ctx context.Context, _ component.Host) error {
 	s.logger.Info("Starting SQL Server receiver")
+
+	// Initialize New Relic APM (safe to call multiple times, only inits once)
+	if err := initNewRelicAPM(); err != nil {
+		s.logger.Warn("Failed to initialize New Relic APM", zap.Error(err))
+		// Don't fail startup if New Relic initialization fails
+	}
 
 	connection, err := NewSQLConnection(ctx, s.config, s.logger)
 	if err != nil {
