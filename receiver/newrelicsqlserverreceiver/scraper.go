@@ -241,6 +241,19 @@ func (s *sqlServerScraper) scrape(ctx context.Context) (pmetric.Metrics, error) 
 	// Track scrape start time for New Relic reporting
 	scrapeStartTime := time.Now()
 
+	// START: Single parent transaction for entire scrape cycle
+	var scrapeTxn *newrelic.Transaction
+	if GlobalNRApp != nil {
+		scrapeTxn = GlobalNRApp.StartTransaction("sqlserver/scrape")
+		scrapeTxn.AddAttribute("hostname", s.config.Hostname)
+		scrapeTxn.AddAttribute("port", s.config.Port)
+		scrapeTxn.AddAttribute("start_time", scrapeStartTime.Unix())
+		scrapeTxn.AddAttribute("engine_edition", s.engineEdition)
+
+		// Inject transaction into context so SQL queries can access it
+		ctx = newrelic.NewContext(ctx, scrapeTxn)
+	}
+
 	s.logger.Debug("Starting SQL Server metrics collection",
 		zap.String("hostname", s.config.Hostname),
 		zap.String("port", s.config.Port))
@@ -258,12 +271,10 @@ func (s *sqlServerScraper) scrape(ctx context.Context) (pmetric.Metrics, error) 
 	// ALWAYS scrape database metrics - mandatory metrics will always be emitted
 	databaseStartTime := time.Now()
 
-	// START New Relic transaction for database category
-	var databaseTxn *newrelic.Transaction
-	if GlobalNRApp != nil {
-		databaseTxn = GlobalNRApp.StartTransaction("sqlserver/database_metrics")
-		databaseTxn.AddAttribute("category", "database_metrics")
-		databaseTxn.AddAttribute("start_time", databaseStartTime.Unix())
+	// START New Relic segment for database category
+	var databaseSegment *newrelic.Segment
+	if scrapeTxn != nil {
+		databaseSegment = scrapeTxn.StartSegment("database_metrics")
 	}
 
 	s.logger.Info("Starting database metrics collection", zap.Time("start_time", databaseStartTime))
@@ -295,19 +306,21 @@ func (s *sqlServerScraper) scrape(ctx context.Context) (pmetric.Metrics, error) 
 	atomic.AddInt64(&DatabaseScraperCalls, 1)
 	atomic.StoreInt64(&LastDatabaseDurationMs, databaseDuration.Milliseconds())
 
-	// END New Relic transaction for database category
-	if databaseTxn != nil {
-		databaseTxn.AddAttribute("end_time", time.Now().Unix())
-		databaseTxn.AddAttribute("duration_ms", databaseDuration.Milliseconds())
-		databaseTxn.AddAttribute("total_scrapers", len(databaseScrapers))
-		databaseTxn.AddAttribute("queries_passed", len(databaseScrapers)-len(dbErrors))
-		databaseTxn.AddAttribute("queries_failed", len(dbErrors))
+	// END New Relic segment for database category
+	if databaseSegment != nil {
+		databaseSegment.End()
+	}
+	// Add attributes to parent transaction
+	if scrapeTxn != nil {
+		scrapeTxn.AddAttribute("database_duration_ms", databaseDuration.Milliseconds())
+		scrapeTxn.AddAttribute("database_total_scrapers", len(databaseScrapers))
+		scrapeTxn.AddAttribute("database_queries_passed", len(databaseScrapers)-len(dbErrors))
+		scrapeTxn.AddAttribute("database_queries_failed", len(dbErrors))
 		if len(dbErrors) > 0 {
 			for _, err := range dbErrors {
-				databaseTxn.NoticeError(err)
+				scrapeTxn.NoticeError(err)
 			}
 		}
-		databaseTxn.End()
 	}
 
 	s.logger.Info("Completed database metrics collection",
@@ -319,12 +332,10 @@ func (s *sqlServerScraper) scrape(ctx context.Context) (pmetric.Metrics, error) 
 	// Scrape slow query metrics (always enabled)
 	slowQueryStartTime := time.Now()
 
-	// START New Relic transaction for slow query category
-	var slowQueryTxn *newrelic.Transaction
-	if GlobalNRApp != nil {
-		slowQueryTxn = GlobalNRApp.StartTransaction("sqlserver/slow_query_metrics")
-		slowQueryTxn.AddAttribute("category", "slow_query_metrics")
-		slowQueryTxn.AddAttribute("start_time", slowQueryStartTime.Unix())
+	// START New Relic segment for slow query category
+	var slowQuerySegment *newrelic.Segment
+	if scrapeTxn != nil {
+		slowQuerySegment = scrapeTxn.StartSegment("slow_query_metrics")
 	}
 
 	s.logger.Info("Starting slow query metrics collection", zap.Time("start_time", slowQueryStartTime))
@@ -384,22 +395,25 @@ func (s *sqlServerScraper) scrape(ctx context.Context) (pmetric.Metrics, error) 
 	atomic.StoreInt64(&SlowQueryCount, int64(len(slowQueries)))
 	atomic.StoreInt64(&LastSlowQueryDurationMs, time.Since(slowQueryStartTime).Milliseconds())
 
-	// END New Relic transaction for slow query category
+	// END New Relic segment for slow query category
 	slowQueryDuration := time.Since(slowQueryStartTime)
-	if slowQueryTxn != nil {
-		slowQueryTxn.AddAttribute("end_time", time.Now().Unix())
-		slowQueryTxn.AddAttribute("duration_ms", slowQueryDuration.Milliseconds())
-		slowQueryTxn.AddAttribute("queries_found", len(slowQueries))
-		slowQueryTxn.AddAttribute("queries_passed", len(slowQueries))
-		slowQueryTxn.AddAttribute("queries_failed", 0)
+	if slowQuerySegment != nil {
+		slowQuerySegment.End()
+	}
+	// Add attributes to parent transaction
+	if scrapeTxn != nil {
+		scrapeTxn.AddAttribute("slow_query_duration_ms", slowQueryDuration.Milliseconds())
+		scrapeTxn.AddAttribute("slow_queries_found", len(slowQueries))
+		scrapeTxn.AddAttribute("slow_queries_passed", len(slowQueries))
 		if err != nil {
-			slowQueryTxn.AddAttribute("queries_failed", 1)
-			slowQueryTxn.NoticeError(err)
+			scrapeTxn.AddAttribute("slow_queries_failed", 1)
+			scrapeTxn.NoticeError(err)
+		} else {
+			scrapeTxn.AddAttribute("slow_queries_failed", 0)
 		}
-		slowQueryTxn.End()
 	}
 
-	s.logger.Info("Slow query metrics transaction completed",
+	s.logger.Info("Slow query metrics segment completed",
 		zap.Duration("duration", slowQueryDuration),
 		zap.Int("queries_found", len(slowQueries)),
 		zap.Bool("success", err == nil))
@@ -407,12 +421,10 @@ func (s *sqlServerScraper) scrape(ctx context.Context) (pmetric.Metrics, error) 
 	// Scrape active running queries metrics - split into linked and orphan queries
 	activeQueryStartTime := time.Now()
 
-	// START New Relic transaction for active query category
-	var activeQueryTxn *newrelic.Transaction
-	if GlobalNRApp != nil {
-		activeQueryTxn = GlobalNRApp.StartTransaction("sqlserver/active_query_metrics")
-		activeQueryTxn.AddAttribute("category", "active_query_metrics")
-		activeQueryTxn.AddAttribute("start_time", activeQueryStartTime.Unix())
+	// START New Relic segment for active query category
+	var activeQuerySegment *newrelic.Segment
+	if scrapeTxn != nil {
+		activeQuerySegment = scrapeTxn.StartSegment("active_query_metrics")
 	}
 
 	scrapeCtx, cancel := context.WithTimeout(ctx, s.config.Timeout)
@@ -566,20 +578,22 @@ func (s *sqlServerScraper) scrape(ctx context.Context) (pmetric.Metrics, error) 
 	atomic.StoreInt64(&ActiveQueryCount, int64(len(activeQueries)))
 	atomic.StoreInt64(&LastActiveQueryDurationMs, time.Since(activeQueryStartTime).Milliseconds())
 
-	// END New Relic transaction for active query category
+	// END New Relic segment for active query category
 	activeQueryDuration := time.Since(activeQueryStartTime)
-	if activeQueryTxn != nil {
-		activeQueryTxn.AddAttribute("end_time", time.Now().Unix())
-		activeQueryTxn.AddAttribute("duration_ms", activeQueryDuration.Milliseconds())
-		activeQueryTxn.AddAttribute("queries_found", len(activeQueries))
-		activeQueryTxn.AddAttribute("linked_queries", len(linkedActiveQueries))
-		activeQueryTxn.AddAttribute("orphan_queries", len(orphanActiveQueries))
-		activeQueryTxn.AddAttribute("queries_passed", len(activeQueries))
-		activeQueryTxn.AddAttribute("queries_failed", 0)
-		activeQueryTxn.End()
+	if activeQuerySegment != nil {
+		activeQuerySegment.End()
+	}
+	// Add attributes to parent transaction
+	if scrapeTxn != nil {
+		scrapeTxn.AddAttribute("active_query_duration_ms", activeQueryDuration.Milliseconds())
+		scrapeTxn.AddAttribute("active_queries_found", len(activeQueries))
+		scrapeTxn.AddAttribute("linked_queries", len(linkedActiveQueries))
+		scrapeTxn.AddAttribute("orphan_queries", len(orphanActiveQueries))
+		scrapeTxn.AddAttribute("active_queries_passed", len(activeQueries))
+		scrapeTxn.AddAttribute("active_queries_failed", 0)
 	}
 
-	s.logger.Info("Active query metrics transaction completed",
+	s.logger.Info("Active query metrics segment completed",
 		zap.Duration("duration", activeQueryDuration),
 		zap.Int("queries_found", len(activeQueries)),
 		zap.Int("linked_queries", len(linkedActiveQueries)),
@@ -589,12 +603,10 @@ func (s *sqlServerScraper) scrape(ctx context.Context) (pmetric.Metrics, error) 
 	// ALWAYS scrape instance metrics - mandatory metrics will always be emitted
 	instanceStartTime := time.Now()
 
-	// START New Relic transaction for instance category
-	var instanceTxn *newrelic.Transaction
-	if GlobalNRApp != nil {
-		instanceTxn = GlobalNRApp.StartTransaction("sqlserver/instance_metrics")
-		instanceTxn.AddAttribute("category", "instance_metrics")
-		instanceTxn.AddAttribute("start_time", instanceStartTime.Unix())
+	// START New Relic segment for instance category
+	var instanceSegment *newrelic.Segment
+	if scrapeTxn != nil {
+		instanceSegment = scrapeTxn.StartSegment("instance_metrics")
 	}
 
 	// Scrape all instance metrics concurrently (all independent)
@@ -622,23 +634,25 @@ func (s *sqlServerScraper) scrape(ctx context.Context) (pmetric.Metrics, error) 
 	atomic.AddInt64(&InstanceScraperCalls, 1)
 	atomic.StoreInt64(&LastInstanceDurationMs, time.Since(instanceStartTime).Milliseconds())
 
-	// END New Relic transaction for instance category
+	// END New Relic segment for instance category
 	instanceDuration := time.Since(instanceStartTime)
-	if instanceTxn != nil {
-		instanceTxn.AddAttribute("end_time", time.Now().Unix())
-		instanceTxn.AddAttribute("duration_ms", instanceDuration.Milliseconds())
-		instanceTxn.AddAttribute("total_scrapers", len(instanceScrapers))
-		instanceTxn.AddAttribute("queries_passed", len(instanceScrapers)-len(instanceErrors))
-		instanceTxn.AddAttribute("queries_failed", len(instanceErrors))
+	if instanceSegment != nil {
+		instanceSegment.End()
+	}
+	// Add attributes to parent transaction
+	if scrapeTxn != nil {
+		scrapeTxn.AddAttribute("instance_duration_ms", instanceDuration.Milliseconds())
+		scrapeTxn.AddAttribute("instance_total_scrapers", len(instanceScrapers))
+		scrapeTxn.AddAttribute("instance_queries_passed", len(instanceScrapers)-len(instanceErrors))
+		scrapeTxn.AddAttribute("instance_queries_failed", len(instanceErrors))
 		if len(instanceErrors) > 0 {
 			for _, err := range instanceErrors {
-				instanceTxn.NoticeError(err)
+				scrapeTxn.NoticeError(err)
 			}
 		}
-		instanceTxn.End()
 	}
 
-	s.logger.Info("Instance metrics transaction completed",
+	s.logger.Info("Instance metrics segment completed",
 		zap.Duration("duration", instanceDuration),
 		zap.Int("total_scrapers", len(instanceScrapers)),
 		zap.Int("queries_passed", len(instanceScrapers)-len(instanceErrors)),
@@ -648,12 +662,10 @@ func (s *sqlServerScraper) scrape(ctx context.Context) (pmetric.Metrics, error) 
 	if s.config.EnableUserConnectionMetrics {
 		userConnStartTime := time.Now()
 
-		// START New Relic transaction
-		var userConnTxn *newrelic.Transaction
-		if GlobalNRApp != nil {
-			userConnTxn = GlobalNRApp.StartTransaction("sqlserver/user_connection_metrics")
-			userConnTxn.AddAttribute("category", "user_connection_metrics")
-			userConnTxn.AddAttribute("start_time", userConnStartTime.Unix())
+		// START New Relic segment
+		var userConnSegment *newrelic.Segment
+		if scrapeTxn != nil {
+			userConnSegment = scrapeTxn.StartSegment("user_connection_metrics")
 		}
 
 		userConnectionScrapers := map[string]scrapeFunc{
@@ -671,20 +683,22 @@ func (s *sqlServerScraper) scrape(ctx context.Context) (pmetric.Metrics, error) 
 			scrapeErrors = collectErrors(scrapeErrors, err)
 		}
 
-		// END New Relic transaction
+		// END New Relic segment
 		userConnDuration := time.Since(userConnStartTime)
-		if userConnTxn != nil {
-			userConnTxn.AddAttribute("end_time", time.Now().Unix())
-			userConnTxn.AddAttribute("duration_ms", userConnDuration.Milliseconds())
-			userConnTxn.AddAttribute("total_scrapers", len(userConnectionScrapers))
-			userConnTxn.AddAttribute("queries_passed", len(userConnectionScrapers)-len(userConnErrors))
-			userConnTxn.AddAttribute("queries_failed", len(userConnErrors))
+		if userConnSegment != nil {
+			userConnSegment.End()
+		}
+		// Add attributes to parent transaction
+		if scrapeTxn != nil {
+			scrapeTxn.AddAttribute("user_conn_duration_ms", userConnDuration.Milliseconds())
+			scrapeTxn.AddAttribute("user_conn_total_scrapers", len(userConnectionScrapers))
+			scrapeTxn.AddAttribute("user_conn_queries_passed", len(userConnectionScrapers)-len(userConnErrors))
+			scrapeTxn.AddAttribute("user_conn_queries_failed", len(userConnErrors))
 			if len(userConnErrors) > 0 {
 				for _, err := range userConnErrors {
-					userConnTxn.NoticeError(err)
+					scrapeTxn.NoticeError(err)
 				}
 			}
-			userConnTxn.End()
 		}
 	} else {
 		s.logger.Info("User connection metrics scraping SKIPPED - EnableUserConnectionMetrics is false")
@@ -694,12 +708,10 @@ func (s *sqlServerScraper) scrape(ctx context.Context) (pmetric.Metrics, error) 
 	if s.config.EnableFailoverClusterMetrics {
 		failoverStartTime := time.Now()
 
-		// START New Relic transaction
-		var failoverTxn *newrelic.Transaction
-		if GlobalNRApp != nil {
-			failoverTxn = GlobalNRApp.StartTransaction("sqlserver/failover_cluster_metrics")
-			failoverTxn.AddAttribute("category", "failover_cluster_metrics")
-			failoverTxn.AddAttribute("start_time", failoverStartTime.Unix())
+		// START New Relic segment
+		var failoverSegment *newrelic.Segment
+		if scrapeTxn != nil {
+			failoverSegment = scrapeTxn.StartSegment("failover_cluster_metrics")
 		}
 
 		failoverScrapers := map[string]scrapeFunc{
@@ -714,20 +726,22 @@ func (s *sqlServerScraper) scrape(ctx context.Context) (pmetric.Metrics, error) 
 			scrapeErrors = collectErrors(scrapeErrors, err)
 		}
 
-		// END New Relic transaction
+		// END New Relic segment
 		failoverDuration := time.Since(failoverStartTime)
-		if failoverTxn != nil {
-			failoverTxn.AddAttribute("end_time", time.Now().Unix())
-			failoverTxn.AddAttribute("duration_ms", failoverDuration.Milliseconds())
-			failoverTxn.AddAttribute("total_scrapers", len(failoverScrapers))
-			failoverTxn.AddAttribute("queries_passed", len(failoverScrapers)-len(failoverErrors))
-			failoverTxn.AddAttribute("queries_failed", len(failoverErrors))
+		if failoverSegment != nil {
+			failoverSegment.End()
+		}
+		// Add attributes to parent transaction
+		if scrapeTxn != nil {
+			scrapeTxn.AddAttribute("failover_duration_ms", failoverDuration.Milliseconds())
+			scrapeTxn.AddAttribute("failover_total_scrapers", len(failoverScrapers))
+			scrapeTxn.AddAttribute("failover_queries_passed", len(failoverScrapers)-len(failoverErrors))
+			scrapeTxn.AddAttribute("failover_queries_failed", len(failoverErrors))
 			if len(failoverErrors) > 0 {
 				for _, err := range failoverErrors {
-					failoverTxn.NoticeError(err)
+					scrapeTxn.NoticeError(err)
 				}
 			}
-			failoverTxn.End()
 		}
 	} else {
 		s.logger.Info("Failover cluster metrics scraping SKIPPED - EnableFailoverClusterMetrics is false")
@@ -737,12 +751,10 @@ func (s *sqlServerScraper) scrape(ctx context.Context) (pmetric.Metrics, error) 
 	if s.config.EnableDatabasePrincipalsMetrics {
 		principalsStartTime := time.Now()
 
-		// START New Relic transaction
-		var principalsTxn *newrelic.Transaction
-		if GlobalNRApp != nil {
-			principalsTxn = GlobalNRApp.StartTransaction("sqlserver/database_principals_metrics")
-			principalsTxn.AddAttribute("category", "database_principals_metrics")
-			principalsTxn.AddAttribute("start_time", principalsStartTime.Unix())
+		// START New Relic segment
+		var principalsSegment *newrelic.Segment
+		if scrapeTxn != nil {
+			principalsSegment = scrapeTxn.StartSegment("database_principals_metrics")
 		}
 
 		principalsScrapers := map[string]scrapeFunc{
@@ -755,20 +767,22 @@ func (s *sqlServerScraper) scrape(ctx context.Context) (pmetric.Metrics, error) 
 			scrapeErrors = collectErrors(scrapeErrors, err)
 		}
 
-		// END New Relic transaction
+		// END New Relic segment
 		principalsDuration := time.Since(principalsStartTime)
-		if principalsTxn != nil {
-			principalsTxn.AddAttribute("end_time", time.Now().Unix())
-			principalsTxn.AddAttribute("duration_ms", principalsDuration.Milliseconds())
-			principalsTxn.AddAttribute("total_scrapers", len(principalsScrapers))
-			principalsTxn.AddAttribute("queries_passed", len(principalsScrapers)-len(principalsErrors))
-			principalsTxn.AddAttribute("queries_failed", len(principalsErrors))
+		if principalsSegment != nil {
+			principalsSegment.End()
+		}
+		// Add attributes to parent transaction
+		if scrapeTxn != nil {
+			scrapeTxn.AddAttribute("principals_duration_ms", principalsDuration.Milliseconds())
+			scrapeTxn.AddAttribute("principals_total_scrapers", len(principalsScrapers))
+			scrapeTxn.AddAttribute("principals_queries_passed", len(principalsScrapers)-len(principalsErrors))
+			scrapeTxn.AddAttribute("principals_queries_failed", len(principalsErrors))
 			if len(principalsErrors) > 0 {
 				for _, err := range principalsErrors {
-					principalsTxn.NoticeError(err)
+					scrapeTxn.NoticeError(err)
 				}
 			}
-			principalsTxn.End()
 		}
 	} else {
 		s.logger.Info("Database principals metrics scraping SKIPPED - EnableDatabasePrincipalsMetrics is false")
@@ -778,12 +792,10 @@ func (s *sqlServerScraper) scrape(ctx context.Context) (pmetric.Metrics, error) 
 	if s.config.EnableDatabaseRoleMembershipMetrics {
 		roleMembershipStartTime := time.Now()
 
-		// START New Relic transaction
-		var roleMembershipTxn *newrelic.Transaction
-		if GlobalNRApp != nil {
-			roleMembershipTxn = GlobalNRApp.StartTransaction("sqlserver/database_role_membership_metrics")
-			roleMembershipTxn.AddAttribute("category", "database_role_membership_metrics")
-			roleMembershipTxn.AddAttribute("start_time", roleMembershipStartTime.Unix())
+		// START New Relic segment
+		var roleMembershipSegment *newrelic.Segment
+		if scrapeTxn != nil {
+			roleMembershipSegment = scrapeTxn.StartSegment("database_role_membership_metrics")
 		}
 
 		roleMembershipScrapers := map[string]scrapeFunc{
@@ -797,20 +809,22 @@ func (s *sqlServerScraper) scrape(ctx context.Context) (pmetric.Metrics, error) 
 			scrapeErrors = collectErrors(scrapeErrors, err)
 		}
 
-		// END New Relic transaction
+		// END New Relic segment
 		roleMembershipDuration := time.Since(roleMembershipStartTime)
-		if roleMembershipTxn != nil {
-			roleMembershipTxn.AddAttribute("end_time", time.Now().Unix())
-			roleMembershipTxn.AddAttribute("duration_ms", roleMembershipDuration.Milliseconds())
-			roleMembershipTxn.AddAttribute("total_scrapers", len(roleMembershipScrapers))
-			roleMembershipTxn.AddAttribute("queries_passed", len(roleMembershipScrapers)-len(roleMembershipErrors))
-			roleMembershipTxn.AddAttribute("queries_failed", len(roleMembershipErrors))
+		if roleMembershipSegment != nil {
+			roleMembershipSegment.End()
+		}
+		// Add attributes to parent transaction
+		if scrapeTxn != nil {
+			scrapeTxn.AddAttribute("role_membership_duration_ms", roleMembershipDuration.Milliseconds())
+			scrapeTxn.AddAttribute("role_membership_total_scrapers", len(roleMembershipScrapers))
+			scrapeTxn.AddAttribute("role_membership_queries_passed", len(roleMembershipScrapers)-len(roleMembershipErrors))
+			scrapeTxn.AddAttribute("role_membership_queries_failed", len(roleMembershipErrors))
 			if len(roleMembershipErrors) > 0 {
 				for _, err := range roleMembershipErrors {
-					roleMembershipTxn.NoticeError(err)
+					scrapeTxn.NoticeError(err)
 				}
 			}
-			roleMembershipTxn.End()
 		}
 	} else {
 		s.logger.Info("Database role membership metrics scraping SKIPPED - EnableDatabaseRoleMembershipMetrics is false")
@@ -820,12 +834,10 @@ func (s *sqlServerScraper) scrape(ctx context.Context) (pmetric.Metrics, error) 
 	// ALWAYS scrape wait time metrics - mandatory metrics will always be emitted
 	waitTimeStartTime := time.Now()
 
-	// START New Relic transaction
-	var waitTimeTxn *newrelic.Transaction
-	if GlobalNRApp != nil {
-		waitTimeTxn = GlobalNRApp.StartTransaction("sqlserver/wait_time_metrics")
-		waitTimeTxn.AddAttribute("category", "wait_time_metrics")
-		waitTimeTxn.AddAttribute("start_time", waitTimeStartTime.Unix())
+	// START New Relic segment
+	var waitTimeSegment *newrelic.Segment
+	if scrapeTxn != nil {
+		waitTimeSegment = scrapeTxn.StartSegment("wait_time_metrics")
 	}
 
 	waitTimeScrapers := map[string]scrapeFunc{
@@ -838,32 +850,32 @@ func (s *sqlServerScraper) scrape(ctx context.Context) (pmetric.Metrics, error) 
 		scrapeErrors = collectErrors(scrapeErrors, err)
 	}
 
-	// END New Relic transaction
+	// END New Relic segment
 	waitTimeDuration := time.Since(waitTimeStartTime)
-	if waitTimeTxn != nil {
-		waitTimeTxn.AddAttribute("end_time", time.Now().Unix())
-		waitTimeTxn.AddAttribute("duration_ms", waitTimeDuration.Milliseconds())
-		waitTimeTxn.AddAttribute("total_scrapers", len(waitTimeScrapers))
-		waitTimeTxn.AddAttribute("queries_passed", len(waitTimeScrapers)-len(waitTimeErrors))
-		waitTimeTxn.AddAttribute("queries_failed", len(waitTimeErrors))
+	if waitTimeSegment != nil {
+		waitTimeSegment.End()
+	}
+	// Add attributes to parent transaction
+	if scrapeTxn != nil {
+		scrapeTxn.AddAttribute("wait_time_duration_ms", waitTimeDuration.Milliseconds())
+		scrapeTxn.AddAttribute("wait_time_total_scrapers", len(waitTimeScrapers))
+		scrapeTxn.AddAttribute("wait_time_queries_passed", len(waitTimeScrapers)-len(waitTimeErrors))
+		scrapeTxn.AddAttribute("wait_time_queries_failed", len(waitTimeErrors))
 		if len(waitTimeErrors) > 0 {
 			for _, err := range waitTimeErrors {
-				waitTimeTxn.NoticeError(err)
+				scrapeTxn.NoticeError(err)
 			}
 		}
-		waitTimeTxn.End()
 	}
 
 	// === Security Metrics Category ===
 	if s.config.EnableSecurityMetrics {
 		securityStartTime := time.Now()
 
-		// START New Relic transaction
-		var securityTxn *newrelic.Transaction
-		if GlobalNRApp != nil {
-			securityTxn = GlobalNRApp.StartTransaction("sqlserver/security_metrics")
-			securityTxn.AddAttribute("category", "security_metrics")
-			securityTxn.AddAttribute("start_time", securityStartTime.Unix())
+		// START New Relic segment
+		var securitySegment *newrelic.Segment
+		if scrapeTxn != nil {
+			securitySegment = scrapeTxn.StartSegment("security_metrics")
 		}
 
 		securityScrapers := map[string]scrapeFunc{
@@ -876,20 +888,22 @@ func (s *sqlServerScraper) scrape(ctx context.Context) (pmetric.Metrics, error) 
 			scrapeErrors = collectErrors(scrapeErrors, err)
 		}
 
-		// END New Relic transaction
+		// END New Relic segment
 		securityDuration := time.Since(securityStartTime)
-		if securityTxn != nil {
-			securityTxn.AddAttribute("end_time", time.Now().Unix())
-			securityTxn.AddAttribute("duration_ms", securityDuration.Milliseconds())
-			securityTxn.AddAttribute("total_scrapers", len(securityScrapers))
-			securityTxn.AddAttribute("queries_passed", len(securityScrapers)-len(securityErrors))
-			securityTxn.AddAttribute("queries_failed", len(securityErrors))
+		if securitySegment != nil {
+			securitySegment.End()
+		}
+		// Add attributes to parent transaction
+		if scrapeTxn != nil {
+			scrapeTxn.AddAttribute("security_duration_ms", securityDuration.Milliseconds())
+			scrapeTxn.AddAttribute("security_total_scrapers", len(securityScrapers))
+			scrapeTxn.AddAttribute("security_queries_passed", len(securityScrapers)-len(securityErrors))
+			scrapeTxn.AddAttribute("security_queries_failed", len(securityErrors))
 			if len(securityErrors) > 0 {
 				for _, err := range securityErrors {
-					securityTxn.NoticeError(err)
+					scrapeTxn.NoticeError(err)
 				}
 			}
-			securityTxn.End()
 		}
 	} else {
 		s.logger.Info("Security metrics scraping SKIPPED - EnableSecurityMetrics is false")
@@ -899,12 +913,10 @@ func (s *sqlServerScraper) scrape(ctx context.Context) (pmetric.Metrics, error) 
 	if s.config.EnableLockMetrics {
 		lockStartTime := time.Now()
 
-		// START New Relic transaction
-		var lockTxn *newrelic.Transaction
-		if GlobalNRApp != nil {
-			lockTxn = GlobalNRApp.StartTransaction("sqlserver/lock_metrics")
-			lockTxn.AddAttribute("category", "lock_metrics")
-			lockTxn.AddAttribute("start_time", lockStartTime.Unix())
+		// START New Relic segment
+		var lockSegment *newrelic.Segment
+		if scrapeTxn != nil {
+			lockSegment = scrapeTxn.StartSegment("lock_metrics")
 		}
 
 		lockScrapers := map[string]scrapeFunc{
@@ -917,20 +929,22 @@ func (s *sqlServerScraper) scrape(ctx context.Context) (pmetric.Metrics, error) 
 			scrapeErrors = collectErrors(scrapeErrors, err)
 		}
 
-		// END New Relic transaction
+		// END New Relic segment
 		lockDuration := time.Since(lockStartTime)
-		if lockTxn != nil {
-			lockTxn.AddAttribute("end_time", time.Now().Unix())
-			lockTxn.AddAttribute("duration_ms", lockDuration.Milliseconds())
-			lockTxn.AddAttribute("total_scrapers", len(lockScrapers))
-			lockTxn.AddAttribute("queries_passed", len(lockScrapers)-len(lockErrors))
-			lockTxn.AddAttribute("queries_failed", len(lockErrors))
+		if lockSegment != nil {
+			lockSegment.End()
+		}
+		// Add attributes to parent transaction
+		if scrapeTxn != nil {
+			scrapeTxn.AddAttribute("lock_duration_ms", lockDuration.Milliseconds())
+			scrapeTxn.AddAttribute("lock_total_scrapers", len(lockScrapers))
+			scrapeTxn.AddAttribute("lock_queries_passed", len(lockScrapers)-len(lockErrors))
+			scrapeTxn.AddAttribute("lock_queries_failed", len(lockErrors))
 			if len(lockErrors) > 0 {
 				for _, err := range lockErrors {
-					lockTxn.NoticeError(err)
+					scrapeTxn.NoticeError(err)
 				}
 			}
-			lockTxn.End()
 		}
 	} else {
 		s.logger.Info("Lock metrics scraping SKIPPED - EnableLockMetrics is false")
@@ -940,33 +954,33 @@ func (s *sqlServerScraper) scrape(ctx context.Context) (pmetric.Metrics, error) 
 	if s.config.EnableThreadPoolMetrics {
 		threadPoolStartTime := time.Now()
 
-		// START New Relic transaction
-		var threadPoolTxn *newrelic.Transaction
-		if GlobalNRApp != nil {
-			threadPoolTxn = GlobalNRApp.StartTransaction("sqlserver/thread_pool_metrics")
-			threadPoolTxn.AddAttribute("category", "thread_pool_metrics")
-			threadPoolTxn.AddAttribute("start_time", threadPoolStartTime.Unix())
+		// START New Relic segment
+		var threadPoolSegment *newrelic.Segment
+		if scrapeTxn != nil {
+			threadPoolSegment = scrapeTxn.StartSegment("thread_pool_metrics")
 		}
 
 		threadPoolErr := s.executeConditionalScrape(ctx, s.config.EnableThreadPoolMetrics,
 			"thread pool health metrics", s.threadPoolHealthScraper.ScrapeThreadPoolHealthMetrics)
 		scrapeErrors = collectErrors(scrapeErrors, threadPoolErr)
 
-		// END New Relic transaction
+		// END New Relic segment
 		threadPoolDuration := time.Since(threadPoolStartTime)
-		if threadPoolTxn != nil {
-			threadPoolTxn.AddAttribute("end_time", time.Now().Unix())
-			threadPoolTxn.AddAttribute("duration_ms", threadPoolDuration.Milliseconds())
-			threadPoolTxn.AddAttribute("total_scrapers", 1)
+		if threadPoolSegment != nil {
+			threadPoolSegment.End()
+		}
+		// Add attributes to parent transaction
+		if scrapeTxn != nil {
+			scrapeTxn.AddAttribute("thread_pool_duration_ms", threadPoolDuration.Milliseconds())
+			scrapeTxn.AddAttribute("thread_pool_total_scrapers", 1)
 			if threadPoolErr != nil {
-				threadPoolTxn.AddAttribute("queries_passed", 0)
-				threadPoolTxn.AddAttribute("queries_failed", 1)
-				threadPoolTxn.NoticeError(threadPoolErr)
+				scrapeTxn.AddAttribute("thread_pool_queries_passed", 0)
+				scrapeTxn.AddAttribute("thread_pool_queries_failed", 1)
+				scrapeTxn.NoticeError(threadPoolErr)
 			} else {
-				threadPoolTxn.AddAttribute("queries_passed", 1)
-				threadPoolTxn.AddAttribute("queries_failed", 0)
+				scrapeTxn.AddAttribute("thread_pool_queries_passed", 1)
+				scrapeTxn.AddAttribute("thread_pool_queries_failed", 0)
 			}
-			threadPoolTxn.End()
 		}
 	} else {
 		s.logger.Info("Thread pool metrics scraping SKIPPED - EnableThreadPoolMetrics is false")
@@ -976,33 +990,33 @@ func (s *sqlServerScraper) scrape(ctx context.Context) (pmetric.Metrics, error) 
 	if s.config.EnableTempDBMetrics {
 		tempDBStartTime := time.Now()
 
-		// START New Relic transaction
-		var tempDBTxn *newrelic.Transaction
-		if GlobalNRApp != nil {
-			tempDBTxn = GlobalNRApp.StartTransaction("sqlserver/tempdb_metrics")
-			tempDBTxn.AddAttribute("category", "tempdb_metrics")
-			tempDBTxn.AddAttribute("start_time", tempDBStartTime.Unix())
+		// START New Relic segment
+		var tempDBSegment *newrelic.Segment
+		if scrapeTxn != nil {
+			tempDBSegment = scrapeTxn.StartSegment("tempdb_metrics")
 		}
 
 		tempDBErr := s.executeConditionalScrape(ctx, s.config.EnableTempDBMetrics,
 			"TempDB contention metrics", s.tempdbContentionScraper.ScrapeTempDBContentionMetrics)
 		scrapeErrors = collectErrors(scrapeErrors, tempDBErr)
 
-		// END New Relic transaction
+		// END New Relic segment
 		tempDBDuration := time.Since(tempDBStartTime)
-		if tempDBTxn != nil {
-			tempDBTxn.AddAttribute("end_time", time.Now().Unix())
-			tempDBTxn.AddAttribute("duration_ms", tempDBDuration.Milliseconds())
-			tempDBTxn.AddAttribute("total_scrapers", 1)
+		if tempDBSegment != nil {
+			tempDBSegment.End()
+		}
+		// Add attributes to parent transaction
+		if scrapeTxn != nil {
+			scrapeTxn.AddAttribute("tempdb_duration_ms", tempDBDuration.Milliseconds())
+			scrapeTxn.AddAttribute("tempdb_total_scrapers", 1)
 			if tempDBErr != nil {
-				tempDBTxn.AddAttribute("queries_passed", 0)
-				tempDBTxn.AddAttribute("queries_failed", 1)
-				tempDBTxn.NoticeError(tempDBErr)
+				scrapeTxn.AddAttribute("tempdb_queries_passed", 0)
+				scrapeTxn.AddAttribute("tempdb_queries_failed", 1)
+				scrapeTxn.NoticeError(tempDBErr)
 			} else {
-				tempDBTxn.AddAttribute("queries_passed", 1)
-				tempDBTxn.AddAttribute("queries_failed", 0)
+				scrapeTxn.AddAttribute("tempdb_queries_passed", 1)
+				scrapeTxn.AddAttribute("tempdb_queries_failed", 0)
 			}
-			tempDBTxn.End()
 		}
 	} else {
 		s.logger.Info("TempDB metrics scraping SKIPPED - EnableTempDBMetrics is false")
@@ -1015,18 +1029,21 @@ func (s *sqlServerScraper) scrape(ctx context.Context) (pmetric.Metrics, error) 
 	scrapeDuration := time.Since(scrapeStartTime)
 	metricsCollected := metrics.MetricCount()
 
-	// Create summary transaction for New Relic
-	if GlobalNRApp != nil {
-		summaryTxn := GlobalNRApp.StartTransaction("sqlserver/summary")
-		summaryTxn.AddAttribute("error_count", len(scrapeErrors))
-		summaryTxn.AddAttribute("metrics_collected", metricsCollected)
-		summaryTxn.AddAttribute("duration_ms", scrapeDuration.Milliseconds())
+	// END parent transaction with final summary
+	if scrapeTxn != nil {
+		scrapeTxn.AddAttribute("end_time", time.Now().Unix())
+		scrapeTxn.AddAttribute("total_duration_ms", scrapeDuration.Milliseconds())
+		scrapeTxn.AddAttribute("metrics_collected", metricsCollected)
+		scrapeTxn.AddAttribute("total_error_count", len(scrapeErrors))
+
+		// Add overall success/failure status
 		if len(scrapeErrors) > 0 {
-			for _, err := range scrapeErrors {
-				summaryTxn.NoticeError(err)
-			}
+			scrapeTxn.AddAttribute("status", "partial_success")
+		} else {
+			scrapeTxn.AddAttribute("status", "success")
 		}
-		summaryTxn.End()
+
+		scrapeTxn.End()
 	}
 
 	// Update global metrics for New Relic dashboard

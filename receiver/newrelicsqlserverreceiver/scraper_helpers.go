@@ -7,6 +7,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/newrelic/go-agent/v3/newrelic"
 	"go.uber.org/zap"
 )
 
@@ -81,7 +82,11 @@ func (s *sqlServerScraper) concurrentScrape(ctx context.Context, scrapers map[st
 	// Launch all scrapers concurrently
 	for name, fn := range scrapers {
 		go func(metricName string, scraper scrapeFunc) {
-			err := s.executeScrape(ctx, metricName, scraper)
+			// Create a goroutine-safe copy of the transaction context
+			// This prevents segment ordering issues when running concurrent queries
+			goroutineCtx := s.newGoroutineContext(ctx)
+
+			err := s.executeScrape(goroutineCtx, metricName, scraper)
 			results <- scrapeResult{
 				MetricName: metricName,
 				Error:      err,
@@ -127,4 +132,20 @@ func (s *sqlServerScraper) refreshMetadataCache(ctx context.Context) {
 		s.logger.Warn("Failed to refresh metadata cache", zap.Error(err))
 		// Continue scraping - stale cache is better than no data
 	}
+}
+
+// newGoroutineContext creates a goroutine-safe copy of the transaction context
+// This is required when using New Relic transactions across multiple goroutines
+// to prevent segment ordering violations
+func (s *sqlServerScraper) newGoroutineContext(ctx context.Context) context.Context {
+	txn := newrelic.FromContext(ctx)
+	if txn == nil {
+		// No transaction in context, return original context
+		return ctx
+	}
+
+	// Create a new goroutine-safe transaction and inject it into a new context
+	// This allows each goroutine to end segments independently
+	goroutineTxn := txn.NewGoroutine()
+	return newrelic.NewContext(ctx, goroutineTxn)
 }
