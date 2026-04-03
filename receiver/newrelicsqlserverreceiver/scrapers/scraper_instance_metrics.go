@@ -40,6 +40,7 @@ type InstanceScraper struct {
 
 // NewInstanceScraper creates a new instance scraper
 func NewInstanceScraper(conn SQLConnectionInterface, logger *zap.Logger, mb *metadata.MetricsBuilder, engineEdition int, config ScraperConfig) *InstanceScraper {
+	
 	return &InstanceScraper{
 		connection:    conn,
 		logger:        logger,
